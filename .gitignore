@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Datos capturados (IPs y credenciales reales de los intentos): NO subir
+data/*.db
+data/*.db-journal
+
+# Variables de entorno (token de Telegram)
+.env

@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HoneyWatch — Dashboard</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span class="logo">⬡</span>
+    <div>
+      <h1>HoneyWatch</h1>
+      <p>Honeypot educativo · monitoreo en tiempo real</p>
+    </div>
+  </div>
+  <div class="live"><span class="dot"></span><span id="live-text">EN VIVO</span></div>
+</header>
+
+<section class="traps" id="traps"></section>
+
+<section class="kpis">
+  <div class="kpi"><span class="label">Intentos totales</span><span class="value" id="k-total">0</span></div>
+  <div class="kpi"><span class="label">IPs únicas</span><span class="value" id="k-ips">0</span></div>
+  <div class="kpi"><span class="label">Último minuto</span><span class="value" id="k-min">0</span></div>
+  <div class="kpi"><span class="label">Servicio más atacado</span><span class="value small" id="k-top">—</span></div>
+</section>
+
+<section class="grid">
+  <div class="card wide">
+    <h2>Actividad — últimos 30 minutos</h2>
+    <div class="chart-box"><canvas id="c-timeline"></canvas></div>
+  </div>
+  <div class="card">
+    <h2>Ataques por servicio</h2>
+    <div class="chart-box"><canvas id="c-service"></canvas></div>
+  </div>
+  <div class="card">
+    <h2>Origen (país)</h2>
+    <div class="chart-box"><canvas id="c-country"></canvas></div>
+  </div>
+  <div class="card">
+    <h2>Top IPs atacantes</h2>
+    <table class="mini"><thead><tr><th>IP</th><th>Ubicación</th><th>Intentos</th></tr></thead>
+      <tbody id="t-ips"></tbody></table>
+  </div>
+  <div class="card">
+    <h2>Credenciales capturadas</h2>
+    <table class="mini"><thead><tr><th>Usuario</th><th>Contraseña</th><th>Servicio</th><th>#</th></tr></thead>
+      <tbody id="t-creds"></tbody></table>
+  </div>
+</section>
+
+<section class="card feed">
+  <h2>Intentos recientes <span class="hint">clic en una fila para ver el payload</span></h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Hora</th><th>IP origen</th><th>Servicio</th><th>Puerto</th><th>Ubicación</th><th>ISP</th><th>Usuario</th><th>Payload</th></tr></thead>
+      <tbody id="t-feed"></tbody>
+    </table>
+  </div>
+</section>
+
+<div class="modal" id="modal" hidden>
+  <div class="modal-box">
+    <div class="modal-head"><h3 id="m-title"></h3><button id="m-close">✕</button></div>
+    <pre id="m-body"></pre>
+  </div>
+</div>
+
+<script>
+const COLORS = { SSH: "#ff5470", FTP: "#ffb020", HTTP: "#3ea6ff", WordPress: "#b18cff", MySQL: "#2ee59d" };
+const REFRESH_MS = 2000;
+let seenIds = new Set();
+let firstLoad = true;
+
+// Escapar SIEMPRE lo que viene del atacante (evita XSS en el dashboard)
+const esc = s => String(s ?? "").replace(/[&<>"']/g,
+  c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+Chart.defaults.color = "#8b98b5";
+Chart.defaults.borderColor = "rgba(139,152,181,.12)";
+Chart.defaults.font.family = "'Segoe UI', system-ui, sans-serif";
+
+const timeline = new Chart(document.getElementById("c-timeline"), {
+  type: "line",
+  data: { labels: [], datasets: [{ label: "Intentos", data: [], borderColor: "#ff5470",
+    backgroundColor: "rgba(255,84,112,.15)", fill: true, tension: .35, pointRadius: 0, borderWidth: 2 }] },
+  options: { maintainAspectRatio: false, animation: { duration: 300 },
+    plugins: { legend: { display: false } },
+    scales: { y: { beginAtZero: true, ticks: { precision: 0 } }, x: { ticks: { maxTicksLimit: 10 } } } }
+});
+
+const services = new Chart(document.getElementById("c-service"), {
+  type: "doughnut",
+  data: { labels: [], datasets: [{ data: [], backgroundColor: [], borderWidth: 0 }] },
+  options: { maintainAspectRatio: false, cutout: "65%",
+    plugins: { legend: { position: "bottom", labels: { boxWidth: 12 } } } }
+});
+
+const countries = new Chart(document.getElementById("c-country"), {
+  type: "bar",
+  data: { labels: [], datasets: [{ data: [], backgroundColor: "#3ea6ff", borderRadius: 4 }] },
+  options: { maintainAspectRatio: false, indexAxis: "y",
+    plugins: { legend: { display: false } },
+    scales: { x: { beginAtZero: true, ticks: { precision: 0 } } } }
+});
+
+function locHtml(a) {
+  if (!a.country) return '<span class="muted">buscando…</span>';
+  if (a.country_code === "LAN") return '<span class="tag lan">Red local</span>';
+  return `<span class="tag">${esc(a.country_code)}</span> ${esc(a.city || a.country)}`;
+}
+
+async function refresh() {
+  try {
+    const [stats, attempts] = await Promise.all([
+      fetch("/api/stats").then(r => r.json()),
+      fetch("/api/attempts?limit=60").then(r => r.json()),
+    ]);
+    renderStats(stats);
+    renderFeed(attempts);
+    document.getElementById("live-text").textContent = "EN VIVO";
+    document.querySelector(".live").classList.remove("off");
+  } catch (e) {
+    document.getElementById("live-text").textContent = "SIN CONEXIÓN";
+    document.querySelector(".live").classList.add("off");
+  }
+}
+
+function renderStats(s) {
+  document.getElementById("k-total").textContent = s.total;
+  document.getElementById("k-ips").textContent = s.unique_ips;
+  document.getElementById("k-min").textContent = s.last_minute;
+  document.getElementById("k-top").textContent =
+    s.by_service.length ? `${s.by_service[0].service} (${s.by_service[0].c})` : "—";
+
+  document.getElementById("traps").innerHTML = s.traps.map(t =>
+    `<div class="trap ${t.active ? "on" : "off"}" style="--c:${COLORS[t.service] || "#888"}">
+       <span class="tdot"></span>${esc(t.service)} <b>:${t.port}</b>
+       <small>${t.active ? "activo" : "puerto ocupado"}</small></div>`).join("");
+
+  timeline.data.labels = s.timeline.map(t => t.minute);
+  timeline.data.datasets[0].data = s.timeline.map(t => t.count);
+  timeline.update();
+
+  services.data.labels = s.by_service.map(x => x.service);
+  services.data.datasets[0].data = s.by_service.map(x => x.c);
+  services.data.datasets[0].backgroundColor = s.by_service.map(x => COLORS[x.service] || "#888");
+  services.update();
+
+  countries.data.labels = s.by_country.map(x => x.country);
+  countries.data.datasets[0].data = s.by_country.map(x => x.c);
+  countries.update();
+
+  document.getElementById("t-ips").innerHTML = s.top_ips.map(x =>
+    `<tr><td class="mono">${esc(x.ip)}</td><td>${esc(x.city || x.country || "—")}</td><td><b>${x.c}</b></td></tr>`
+  ).join("") || '<tr><td colspan="3" class="muted">Sin datos aún</td></tr>';
+
+  document.getElementById("t-creds").innerHTML = s.top_creds.map(x =>
+    `<tr><td class="mono">${esc(x.username)}</td><td class="mono">${esc(x.password ?? "—")}</td>
+     <td><span class="svc" style="--c:${COLORS[x.service]}">${esc(x.service)}</span></td><td>${x.c}</td></tr>`
+  ).join("") || '<tr><td colspan="4" class="muted">Sin credenciales aún</td></tr>';
+}
+
+let attemptsById = {};
+function renderFeed(list) {
+  attemptsById = {};
+  const rows = list.map(a => {
+    attemptsById[a.id] = a;
+    const isNew = !firstLoad && !seenIds.has(a.id);
+    seenIds.add(a.id);
+    const preview = (a.payload || "").replace(/\s+/g, " ").slice(0, 60);
+    return `<tr data-id="${a.id}" class="${isNew ? "new" : ""}">
+      <td class="mono">${esc(a.timestamp.slice(11))}</td>
+      <td class="mono">${esc(a.ip)}</td>
+      <td><span class="svc" style="--c:${COLORS[a.service]}">${esc(a.service)}</span></td>
+      <td class="mono">${a.dst_port}</td>
+      <td>${locHtml(a)}</td>
+      <td class="muted">${esc(a.isp || "")}</td>
+      <td class="mono">${esc(a.username ?? "")}</td>
+      <td class="mono payload">${esc(preview)}</td></tr>`;
+  });
+  document.getElementById("t-feed").innerHTML =
+    rows.join("") || '<tr><td colspan="8" class="muted center">Esperando el primer ataque… prueba con nmap -sV contra esta PC</td></tr>';
+  firstLoad = false;
+}
+
+document.getElementById("t-feed").addEventListener("click", e => {
+  const tr = e.target.closest("tr[data-id]");
+  if (!tr) return;
+  const a = attemptsById[tr.dataset.id];
+  document.getElementById("m-title").textContent =
+    `${a.service} · ${a.ip}:${a.src_port} → :${a.dst_port} · ${a.timestamp}`;
+  let txt = "";
+  if (a.username !== null) txt += `Usuario:    ${a.username}\nContraseña: ${a.password ?? "—"}\n\n`;
+  txt += a.payload || "";
+  document.getElementById("m-body").textContent = txt;   // textContent = seguro
+  document.getElementById("modal").hidden = false;
+});
+document.getElementById("m-close").onclick = () => document.getElementById("modal").hidden = true;
+document.getElementById("modal").addEventListener("click", e => {
+  if (e.target.id === "modal") e.currentTarget.hidden = true;
+});
+
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>
